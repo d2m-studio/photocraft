@@ -173,7 +173,20 @@ pub fn rgb_to_cmyk_naive(rgb: [f32; 3]) -> [f32; 4] {
     [(1.0 - rgb[0] - k) / d, (1.0 - rgb[1] - k) / d, (1.0 - rgb[2] - k) / d, k]
 }
 
-const D50: [f32; 3] = [0.964_22, 1.0, 0.825_21];
+/// The D50 white point (ICC PCS).
+pub const D50: [f32; 3] = [0.964_22, 1.0, 0.825_21];
+
+/// Linear sRGB → D50 XYZ (Bradford-adapted, as in the ICC sRGB profile). Rows sum to [`D50`].
+pub const SRGB_TO_XYZ_D50: [[f32; 3]; 3] = [[0.436_074, 0.385_064, 0.143_080], [0.222_504, 0.716_878, 0.060_618], [0.013_932, 0.097_104, 0.714_173]];
+
+/// D50 XYZ → linear sRGB (the inverse of [`SRGB_TO_XYZ_D50`]).
+pub const XYZ_D50_TO_SRGB: [[f32; 3]; 3] = [[3.133_856, -1.616_867, -0.490_615], [-0.978_768, 1.916_142, 0.033_454], [0.071_945, -0.228_991, 1.405_243]];
+
+/// `m · v` for a row-major 3 × 3 matrix.
+#[inline]
+pub fn mat3_mul(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
+    m.map(|r| r[0] * v[0] + r[1] * v[1] + r[2] * v[2])
+}
 
 /// CIE L*a*b* (D50) → encoded sRGB (Bradford-adapted to D65).
 pub fn lab_to_srgb(lab: [f32; 3]) -> [f32; 3] {
@@ -183,32 +196,63 @@ pub fn lab_to_srgb(lab: [f32; 3]) -> [f32; 3] {
     let fz = fy - b / 200.0;
     let finv = |t: f32| if t > 6.0 / 29.0 { t * t * t } else { 3.0 * (6.0f32 / 29.0).powi(2) * (t - 4.0 / 29.0) };
     let xyz = [finv(fx) * D50[0], finv(fy) * D50[1], finv(fz) * D50[2]];
-    // D50 XYZ → linear sRGB (Bradford-adapted matrix)
-    let m = [[3.133_856, -1.616_867, -0.490_615], [-0.978_768, 1.916_142, 0.033_454], [0.071_945, -0.228_991, 1.405_243]];
-    let mut out = [0.0f32; 3];
-    for i in 0..3 {
-        let lin = m[i][0] * xyz[0] + m[i][1] * xyz[1] + m[i][2] * xyz[2];
-        out[i] = linear_to_srgb(lin.clamp(0.0, 1.0));
-    }
-    out
+    mat3_mul(&XYZ_D50_TO_SRGB, xyz).map(|lin| linear_to_srgb(lin.clamp(0.0, 1.0)))
 }
 
 /// Encoded sRGB → CIE L*a*b* (D50).
 pub fn srgb_to_lab(rgb: [f32; 3]) -> [f32; 3] {
-    let lin = [srgb_to_linear(rgb[0]), srgb_to_linear(rgb[1]), srgb_to_linear(rgb[2])];
-    let m = [[0.436_074, 0.385_064, 0.143_080], [0.222_504, 0.716_878, 0.060_618], [0.013_932, 0.097_104, 0.714_173]];
-    let mut xyz = [0.0f32; 3];
-    for i in 0..3 {
-        xyz[i] = (m[i][0] * lin[0] + m[i][1] * lin[1] + m[i][2] * lin[2]) / D50[i];
-    }
+    let lin = rgb.map(srgb_to_linear);
+    let xyz = mat3_mul(&SRGB_TO_XYZ_D50, lin);
     let f = |t: f32| if t > (6.0f32 / 29.0).powi(3) { t.cbrt() } else { t / (3.0 * (6.0f32 / 29.0).powi(2)) + 4.0 / 29.0 };
-    let (fx, fy, fz) = (f(xyz[0]), f(xyz[1]), f(xyz[2]));
+    let (fx, fy, fz) = (f(xyz[0] / D50[0]), f(xyz[1] / D50[1]), f(xyz[2] / D50[2]));
     [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
 }
 
 /// Rec.601 luma used by Photoshop's Grayscale conversion default.
 pub fn rgb_to_gray(rgb: [f32; 3]) -> f32 {
     0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+}
+
+/// HSB of an sRGB colour with the hue in sextants (0..6) instead of degrees, and hue 0 for greys.
+pub fn rgb_to_hsb_sextant(rgb: [f32; 3]) -> [f32; 3] {
+    let (mx, mn) = (rgb[0].max(rgb[1]).max(rgb[2]), rgb[0].min(rgb[1]).min(rgb[2]));
+    let d = mx - mn;
+    let h = if d <= 0.0 {
+        0.0
+    } else if mx == rgb[0] {
+        ((rgb[1] - rgb[2]) / d).rem_euclid(6.0)
+    } else if mx == rgb[1] {
+        (rgb[2] - rgb[0]) / d + 2.0
+    } else {
+        (rgb[0] - rgb[1]) / d + 4.0
+    };
+    [h, if mx > 0.0 { d / mx } else { 0.0 }, mx]
+}
+
+/// The sRGB colour at a hue sextant (0..6) with the given chroma, raised by offset on every channel.
+pub fn rgb_from_hue_sextant(sextant: f32, chroma: f32, offset: f32) -> [f32; 3] {
+    let x = chroma * (1.0 - (sextant.rem_euclid(2.0) - 1.0).abs());
+    let (r, g, b) = match sextant as u32 {
+        0 => (chroma, x, 0.0),
+        1 => (x, chroma, 0.0),
+        2 => (0.0, chroma, x),
+        3 => (0.0, x, chroma),
+        4 => (x, 0.0, chroma),
+        _ => (chroma, 0.0, x),
+    };
+    [r + offset, g + offset, b + offset]
+}
+
+/// HSB to sRGB, the hue in degrees (wrapping) and saturation and brightness in 0..1, as Photoshop's HSB.
+pub fn hsb_to_rgb([h, s, v]: [f32; 3]) -> [f32; 3] {
+    let chroma = v * s;
+    rgb_from_hue_sextant(h.rem_euclid(360.0) / 60.0, chroma, v - chroma)
+}
+
+/// sRGB to HSB, the hue in degrees 0..360 and saturation and brightness in 0..1.
+pub fn rgb_to_hsb(rgb: [f32; 3]) -> [f32; 3] {
+    let [h, s, v] = rgb_to_hsb_sextant(rgb);
+    [60.0 * h, s, v]
 }
 
 #[cfg(test)]
@@ -292,6 +336,7 @@ mod tests {
         });
     }
 
+    /// Lab round-trips sRGB and puts white at L 100 and black at L 0.
     #[test]
     fn lab_roundtrip_and_anchors() {
         let white = srgb_to_lab([1.0, 1.0, 1.0]);
@@ -302,6 +347,24 @@ mod tests {
             let back = lab_to_srgb(srgb_to_lab(rgb));
             for i in 0..3 {
                 assert!((back[i] - rgb[i]).abs() < 2e-3, "{rgb:?} -> {back:?}");
+            }
+        }
+    }
+
+    /// HSB hits the primary and grey anchors and round-trips sRGB.
+    #[test]
+    fn hsb_conversions_match_known_colours_and_round_trip() {
+        assert_eq!(hsb_to_rgb([120.0, 1.0, 1.0]), [0.0, 1.0, 0.0]);
+        assert_eq!(hsb_to_rgb([0.0, 0.0, 0.5]), [0.5, 0.5, 0.5]);
+        assert_eq!(rgb_to_hsb([0.0, 0.0, 1.0]), [240.0, 1.0, 1.0]);
+        assert_eq!(rgb_to_hsb([0.25, 0.25, 0.25]), [0.0, 0.0, 0.25]);
+        for r in 0..=8 {
+            for g in 0..=8 {
+                for b in 0..=8 {
+                    let c = [r as f32 / 8.0, g as f32 / 8.0, b as f32 / 8.0];
+                    let back = hsb_to_rgb(rgb_to_hsb(c));
+                    assert!(back.iter().zip(c).all(|(x, y)| (x - y).abs() < 1e-5), "{c:?} -> {back:?}");
+                }
             }
         }
     }

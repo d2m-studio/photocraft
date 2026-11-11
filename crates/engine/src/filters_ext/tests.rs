@@ -19,12 +19,41 @@ fn session() -> Session {
     s
 }
 
+/// Recorded Lens Flare centers can be beyond the canvas, without clipping to its edge.
+#[test]
+fn lens_flare_keeps_off_canvas_centers_and_native_defaults() {
+    let Some(FilterParams::LensFlare { center_x, center_y, .. }) = params_for("filter.render.lensFlare", &json!({"centerX": 5.0, "centerY": -5.0})) else {
+        panic!("Lens Flare")
+    };
+    assert_eq!((center_x, center_y), (5.0, -5.0));
+    let Some(FilterParams::LensFlare { center_x, center_y, .. }) = params_for("filter.render.lensFlare", &json!({})) else { panic!("Lens Flare") };
+    assert_eq!((center_x, center_y), (0.5, 0.5));
+}
+
+/// Extreme centers and malformed inputs remain bounded command executions with finite pixels.
+#[test]
+fn lens_flare_extreme_centers_do_not_panic_or_corrupt_pixels() {
+    for lens in ["zoom", "prime35", "prime105", "moviePrime"] {
+        for p in [
+            json!({"centerX": 1e300, "centerY": -1e300, "lens": lens}),
+            json!({"centerX": 1e38, "centerY": -1e38, "lens": lens}),
+            json!({"centerX": null, "centerY": [], "lens": lens}),
+            json!({"centerX": 5, "centerY": -5, "brightness": -100, "lens": lens}),
+        ] {
+            let mut s = session();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.execute("filter.render.lensFlare", p.clone())));
+            assert!(result.is_ok(), "{p}");
+            assert!(pixels(&s).iter().all(|v| v.is_finite()), "non-finite pixels for {p}");
+        }
+    }
+}
+
 fn pixels(s: &Session) -> Vec<f32> {
     let d = s.active().unwrap();
     d.doc.layer(d.active_layer.unwrap()).unwrap().surface().unwrap().read_region(Rect::new(0, 0, 48, 32))
 }
 
-const IDS: [&str; 33] = [
+const IDS: [&str; 34] = [
     "filter.pixelate.colorHalftone",
     "filter.pixelate.crystallize",
     "filter.pixelate.facet",
@@ -42,6 +71,7 @@ const IDS: [&str; 33] = [
     "filter.render.fibers",
     "filter.render.lensFlare",
     "filter.render.lightingEffects",
+    "filter.render.relight",
     "filter.noise.reduceNoise",
     "filter.blur.smartBlur",
     "filter.blur.lensBlur",
@@ -164,6 +194,27 @@ fn colour_filters_use_and_record_tool_colours() {
 }
 
 #[test]
+fn fibers_fill_an_empty_layer() {
+    // #5241: Fibers renders from the colours, not the layer's pixels, so an empty layer fills
+    // like in Photoshop (and can be transformed afterwards).
+    let mut s = Session::new();
+    s.execute("file.new", json!({"width": 48, "height": 32})).unwrap();
+    s.execute("layer.new.layer", json!({})).unwrap();
+    s.execute("filter.render.fibers", json!({"seed": 3})).unwrap();
+    let px = pixels(&s);
+    assert!(px.as_chunks::<4>().0.iter().all(|p| p[3] == 1.0), "every pixel is rendered opaque");
+    s.execute("edit.transform.flipHorizontal", json!({})).unwrap();
+
+    // With a selection only the selection fills.
+    s.execute("layer.new.layer", json!({})).unwrap();
+    s.execute("select.rect", json!({"x": 4, "y": 4, "width": 10, "height": 6})).unwrap();
+    s.execute("filter.render.fibers", json!({"seed": 3})).unwrap();
+    let d = s.active().unwrap();
+    let surf = d.doc.layer(d.active_layer.unwrap()).unwrap().surface().unwrap();
+    assert_eq!(surf.content_bounds(), Rect::new(4, 4, 14, 10));
+}
+
+#[test]
 fn displace_reads_another_document() {
     let mut s = session();
     // Map document: a flat colour that shifts 3 px right at 25 % (see the algo test).
@@ -198,6 +249,51 @@ fn lens_blur_uses_the_layer_mask_as_depth() {
     assert_ne!(pixels(&s), before);
 }
 
+/// #7400: an alpha channel is a Lens Blur depth source, by name or index, as Photoshop lists
+/// the document's channels in Depth Map › Source. A missing channel is an error that changes
+/// nothing, and on a Smart Object (whose smart filters re-render without the channels) it is
+/// refused instead of silently blurring without depth.
+#[test]
+fn lens_blur_reads_an_alpha_channel_as_depth() {
+    let mut s = session();
+    // A white channel: depth 1 everywhere. Creating it targets it; the filter is for the layer.
+    s.execute("channel.new", json!({"name": "Depth Map", "fill": "white"})).unwrap();
+    s.execute("channel.target", json!({"channel": "composite"})).unwrap();
+    let before = pixels(&s);
+    for channel in [json!("Depth Map"), json!(0)] {
+        let p = |focal: f64| json!({"radius": 6, "depthMap": "channel", "depthChannel": channel, "focalDistance": focal});
+        // Focal distance 255 puts depth 1 in focus: nothing blurs.
+        s.execute("filter.blur.lensBlur", p(255.0)).unwrap();
+        assert_eq!(pixels(&s), before, "{channel}: in focus");
+        s.execute("filter.blur.lensBlur", p(0.0)).unwrap();
+        assert_ne!(pixels(&s), before, "{channel}: out of focus blurs");
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(pixels(&s), before);
+    }
+    for bad in [
+        json!({"radius": 6, "depthMap": "channel"}),
+        json!({"radius": 6, "depthMap": "channel", "depthChannel": "Nope"}),
+        json!({"radius": 6, "depthMap": "channel", "depthChannel": 7}),
+    ] {
+        let doc = s.active().unwrap().doc.clone();
+        let past = s.active().unwrap().history.past_len();
+        let e = s.execute("filter.blur.lensBlur", bad.clone()).unwrap_err().to_string();
+        assert!(e.contains("Lens Blur"), "{bad}: {e}");
+        assert_eq!(pixels(&s), before, "{bad}: nothing changed");
+        let st = s.active().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&doc, &st.doc), "{bad}: the document was replaced");
+        assert_eq!(st.history.past_len(), past, "{bad}: a history step was recorded");
+    }
+    s.execute("layer.smartObjects.convertToSmartObject", json!({})).unwrap();
+    let doc = s.active().unwrap().doc.clone();
+    let past = s.active().unwrap().history.past_len();
+    let e = s.execute("filter.blur.lensBlur", json!({"radius": 6, "depthMap": "channel", "depthChannel": "Depth Map"})).unwrap_err().to_string();
+    assert!(e.contains("Smart Object"), "{e}");
+    let st = s.active().unwrap();
+    assert!(std::sync::Arc::ptr_eq(&doc, &st.doc), "no smart filter was added");
+    assert_eq!(st.history.past_len(), past, "no history step");
+}
+
 #[test]
 fn params_map_to_algorithm_units() {
     assert_eq!(params_for("filter.pixelate.crystallize", &json!({"cellSize": 1})), Some(FilterParams::Crystallize { cell_size: 3.0, seed: 0 }));
@@ -214,4 +310,136 @@ fn params_map_to_algorithm_units() {
     let Some(FilterParams::Shear { points, .. }) = params_for("filter.distort.shear", &json!({"points": [[0, 0.1], [1, -0.1]]})) else { panic!() };
     assert_eq!(points, vec![[0.0, 0.1], [1.0, -0.1]]);
     assert!(params_for("filter.nope", &json!({})).is_none());
+    assert_eq!(
+        params_for("filter.render.relight", &json!({})),
+        Some(FilterParams::Relight { angle: 45.0, elevation: 40.0, intensity: 40.0, ambient: 55.0, warmth: 0.0, softness: 25.0 })
+    );
+}
+
+fn paint_shaded_disc(s: &mut Session, size: i32) {
+    s.edit("disc", |doc, active| {
+        let surf = doc.layer_mut(active.unwrap()).unwrap().surface_mut().unwrap();
+        let cx = size as f32 / 2.0;
+        let rad = size as f32 * 0.42;
+        for y in 0..size {
+            for x in 0..size {
+                let dx = x as f32 + 0.5 - cx;
+                let dy = y as f32 + 0.5 - cx;
+                let d2 = dx * dx + dy * dy;
+                let px = if d2 <= rad * rad {
+                    let nz = (rad * rad - d2).max(0.0).sqrt() / rad;
+                    let sh = 0.22 + 0.78 * nz;
+                    [0.55 * sh, 0.55 * sh, 0.55 * sh, 1.0]
+                } else {
+                    [0.18, 0.18, 0.18, 1.0]
+                };
+                surf.write_pixel(x, y, &px);
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn relight_session(w: i32, h: i32) -> Session {
+    let mut s = Session::new();
+    s.execute("file.new", json!({"width": w, "height": h})).unwrap();
+    s.execute("layer.new.layer", json!({})).unwrap();
+    paint_shaded_disc(&mut s, w.min(h));
+    s
+}
+
+#[test]
+fn relight_command_exists_and_toggles_with_document() {
+    let spec = crate::commands::find("filter.render.relight").expect("registered");
+    assert_eq!(spec.menu, &["Filter", "Render"]);
+    assert_eq!(spec.label, "Relight…");
+    assert!(spec.journal);
+    let mut s = Session::new();
+    assert!(!s.is_enabled("filter.render.relight"));
+    s.execute("file.new", json!({"width": 32, "height": 32})).unwrap();
+    s.execute("layer.new.layer", json!({})).unwrap();
+    assert!(s.is_enabled("filter.render.relight"));
+    s.execute("type.create", json!({"x": 8, "y": 16, "text": "Hi", "size": 12})).unwrap();
+    assert!(!s.is_enabled("filter.render.relight"));
+}
+
+#[test]
+fn relight_is_disabled_on_a_pixel_locked_layer() {
+    let mut s = relight_session(32, 32);
+    assert!(s.is_enabled("filter.render.relight"));
+    s.execute("layer.setProps", json!({"locks": {"pixels": true}})).unwrap();
+    assert!(!s.is_enabled("filter.render.relight"));
+    assert!(s.execute("filter.render.relight", json!({})).is_err());
+}
+
+#[test]
+fn relight_defaults_change_a_shaded_disc_and_undo() {
+    let mut s = relight_session(48, 48);
+    let before = {
+        let d = s.active().unwrap();
+        d.doc.layer(d.active_layer.unwrap()).unwrap().surface().unwrap().read_region(Rect::new(0, 0, 48, 48))
+    };
+    let depth = s.active().unwrap().history.past_len();
+    s.execute("filter.render.relight", json!({})).unwrap();
+    let after = {
+        let d = s.active().unwrap();
+        d.doc.layer(d.active_layer.unwrap()).unwrap().surface().unwrap().read_region(Rect::new(0, 0, 48, 48))
+    };
+    assert_ne!(after, before);
+    assert_eq!(s.active().unwrap().history.past_len(), depth + 1);
+    s.execute("edit.undo", json!({})).unwrap();
+    let undone = {
+        let d = s.active().unwrap();
+        d.doc.layer(d.active_layer.unwrap()).unwrap().surface().unwrap().read_region(Rect::new(0, 0, 48, 48))
+    };
+    assert_eq!(undone, before);
+}
+
+#[test]
+fn relight_records_a_smart_filter_and_can_be_hidden() {
+    let mut s = relight_session(32, 32);
+    let before = {
+        let d = s.active().unwrap();
+        d.doc.layer(d.active_layer.unwrap()).unwrap().surface().unwrap().read_region(Rect::new(0, 0, 32, 32))
+    };
+    s.execute("filter.convertForSmartFilters", json!({})).unwrap();
+    s.execute("filter.render.relight", json!({"angle": 180, "intensity": 70})).unwrap();
+    let (is_relight, lit) = {
+        let d = s.active().unwrap();
+        let layer = d.doc.layer(d.active_layer.unwrap()).unwrap();
+        let photocraft_doc::LayerContent::Smart(sm) = &layer.content else { panic!("expected a smart object") };
+        let ok = sm.smart_filters.iter().any(|f| f.command == "filter.render.relight");
+        (ok, layer.surface().unwrap().read_region(Rect::new(0, 0, 32, 32)))
+    };
+    assert!(is_relight);
+    assert_ne!(lit, before);
+    s.execute("layer.smartFilter.setVisible", json!({"index": 0, "visible": false})).unwrap();
+    let restored = {
+        let d = s.active().unwrap();
+        d.doc.layer(d.active_layer.unwrap()).unwrap().surface().unwrap().read_region(Rect::new(0, 0, 32, 32))
+    };
+    assert_eq!(restored, before);
+}
+
+#[test]
+fn relight_rejects_bad_params() {
+    let mut s = relight_session(16, 16);
+    assert!(s.execute("filter.render.relight", json!({"intensity": 999})).is_err());
+    assert!(s.execute("filter.render.relight", json!({"elevation": -3})).is_err());
+    assert!(s.execute("filter.render.relight", json!({"angle": "east"})).is_err());
+    assert!(s.execute("filter.render.relight", json!({"softness": 0})).is_err());
+    assert!(s.execute("filter.render.relight", json!(null)).is_err());
+}
+
+#[test]
+fn relight_honours_the_selection() {
+    let mut s = relight_session(48, 32);
+    s.execute("select.rect", json!({"x": 0, "y": 0, "width": 12, "height": 12})).unwrap();
+    let before = pixels(&s);
+    s.execute("filter.render.relight", json!({"angle": 180, "intensity": 70})).unwrap();
+    let after = pixels(&s);
+    let far = (28 * 48 + 40) * 4;
+    assert_eq!(after[far..far + 4], before[far..far + 4]);
+    assert_ne!(after[..12 * 4], before[..12 * 4]);
 }

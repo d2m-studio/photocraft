@@ -4,6 +4,9 @@
 //! JSON that the frontend writes and reads back (the desktop shell stores its `ToolOptions` under
 //! `"toolOptions"`). Two keys the engine understands itself: `"brush"` (brush settings, applied
 //! to the session brush like `tools.setBrush`) and `"foreground"` (Include Color).
+//!
+//! The Crop tool's options-bar presets (New / Delete Crop Preset…) are tool presets of the
+//! `"crop"` tool, as in Photoshop, so they also show in the Tool Presets panel.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -28,6 +31,44 @@ impl Named for ToolPreset {
     fn set_name(&mut self, n: String) {
         self.name = n;
     }
+}
+
+/// The most tool presets kept (saving more is refused; a larger preferences file loads the first).
+pub const MAX_PRESETS: usize = 1000;
+
+/// A preset name: trimmed, 1–[`MAX_NAME`](crate::brush_preset_cmds::MAX_NAME) characters.
+pub(crate) fn checked_name(name: &str, cmd: &str) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(bad(cmd, "the preset name is empty"));
+    }
+    if name.chars().count() > crate::brush_preset_cmds::MAX_NAME {
+        return Err(bad(cmd, format!("preset names are at most {} characters", crate::brush_preset_cmds::MAX_NAME)));
+    }
+    Ok(name.to_string())
+}
+
+/// Read saved tool presets entry by entry, so a damaged entry (wrong type, empty or overlong name,
+/// a duplicate name) is skipped without discarding the others.
+pub(crate) fn load(value: Value) -> Vec<ToolPreset> {
+    let Some(entries) = value.as_array() else { return Vec::new() };
+    let mut presets: Vec<ToolPreset> = Vec::new();
+    for entry in entries {
+        if presets.len() >= MAX_PRESETS {
+            break;
+        }
+        let Ok(mut preset) = serde_json::from_value::<ToolPreset>(entry.clone()) else { continue };
+        let Ok(name) = checked_name(&preset.name, "") else { continue };
+        if preset.tool.trim().is_empty() || presets.iter().any(|p| p.name == name) {
+            continue;
+        }
+        if !preset.options.is_object() {
+            preset.options = json!({});
+        }
+        preset.name = name;
+        presets.push(preset);
+    }
+    presets
 }
 
 fn norm(t: &str) -> String {
@@ -74,6 +115,7 @@ fn new_preset(s: &mut Session, p: &Value) -> Result<Value> {
         "healing",
         "spothealing",
         "historybrush",
+        "arthistorybrush",
         "blur",
         "sharpen",
         "smudge",
@@ -90,8 +132,17 @@ fn new_preset(s: &mut Session, p: &Value) -> Result<Value> {
         let f = s.tools.foreground;
         options["foreground"] = json!(f);
     }
+    if s.presets.tool_presets.len() >= MAX_PRESETS {
+        return Err(bad(CMD, format!("at most {MAX_PRESETS} tool presets can be saved; delete some first")));
+    }
+    let base = match p.get("name") {
+        None | Some(Value::Null) => tool.clone(),
+        Some(Value::String(n)) if n.trim().is_empty() => tool.clone(),
+        Some(Value::String(n)) => checked_name(n, CMD)?,
+        Some(_) => return Err(bad(CMD, "`name` must be a string")),
+    };
     let groups = [Group::new("", s.presets.tool_presets.clone())];
-    let name = super::unique_name(&groups, str_param(p, "name").unwrap_or(&tool));
+    let name = super::unique_name(&groups, &base);
     s.presets.tool_presets.push(ToolPreset { name: name.clone(), tool: tool.clone(), options });
     s.presets_changed();
     Ok(json!({"name": name, "tool": tool}))
@@ -107,13 +158,21 @@ fn select(s: &mut Session, p: &Value) -> Result<Value> {
         .find(|t| t.name == name)
         .cloned()
         .ok_or_else(|| bad(CMD, format!("no tool preset \"{name}\" (see tool.presets.list)")))?;
+    // Validate before applying the brush too: an invalid colour must leave the preset unapplied.
+    let foreground = match t.options.get("foreground") {
+        None => s.tools.foreground,
+        Some(value) => {
+            let valid = value.as_array().is_some_and(|channels| matches!(channels.len(), 3 | 4) && channels.iter().all(Value::is_number));
+            if !valid {
+                return Err(bad(CMD, "`foreground` must be [r, g, b] or [r, g, b, a] numbers"));
+            }
+            crate::commands::color_param(CMD, &t.options, "foreground", s.tools.foreground)?
+        }
+    };
     if let Some(b) = t.options.get("brush").filter(|b| b.is_object()) {
         super::call(s, "tools.setBrush", json!({"brush": b}))?;
     }
-    if let Some(c) = t.options.get("foreground").and_then(Value::as_array).filter(|a| a.len() >= 3) {
-        let v: Vec<f32> = c.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect();
-        s.tools.foreground = [v[0], v[1], v[2], v.get(3).copied().unwrap_or(1.0)];
-    }
+    s.tools.foreground = foreground;
     Ok(json!({"name": t.name, "tool": t.tool, "options": t.options}))
 }
 
@@ -122,6 +181,9 @@ fn edit(s: &mut Session, p: &Value) -> Result<Value> {
     let action = req_str(p, "action", CMD)?.to_string();
     if !matches!(action.as_str(), "rename" | "delete") {
         return Err(bad(CMD, "tool presets support rename and delete"));
+    }
+    if action == "rename" {
+        checked_name(req_str(p, "name", CMD)?, CMD)?;
     }
     let mut groups = vec![Group::new("", std::mem::take(&mut s.presets.tool_presets))];
     let r = edit_groups(&mut groups, &action, p, CMD);
@@ -154,7 +216,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "New Tool Preset…",
             menu: &[],
             shortcut: None,
-            params: r##"{"name":str?=tool,"tool":name,"options":{…}? (opaque; "brush" defaults to the current brush for painting tools),"includeColor":bool=false}"##,
+            params: r##"{"name":str?=tool (at most 255 characters; a taken name gets " 2", " 3"…),"tool":name ("crop" for Crop presets),"options":{…}? (opaque; "brush" defaults to the current brush for painting tools),"includeColor":bool=false}"##,
             enabled: always,
             run: new_preset,
             journal: true,

@@ -4,9 +4,10 @@
 //! TIFF/EP (ISO 12234-2), the Adobe DNG Specification 1.7, ITU-T T.81
 //! (lossless JPEG, process 14), the published structure of Canon's CR2
 //! container, published descriptions of Sony's cRAW code, public maker-note
-//! tag tables, observation of sample files, and the demosaicing papers cited
-//! in [`Demosaic`]. No code from
-//! dcraw, LibRaw, rawspeed, rawler, rawloader or darktable was used.
+//! and RAF tag tables, Nikon Huffman tables recovered by black-box analysis of CC0
+//! samples (see `nefc.rs`), observation of sample files, and the demosaicing
+//! papers cited in [`Demosaic`]. No code from dcraw, LibRaw, rawspeed,
+//! rawler, rawloader or darktable was used.
 //!
 //! * [`identify`] / [`is_raw`] recognise raw files from their bytes.
 //! * [`decode`] reads the undeveloped [`Sensor`] data and metadata.
@@ -15,13 +16,26 @@
 //!   highlight clipping, demosaicing, camera → XYZ → ProPhoto, exposure and
 //!   orientation.
 //! * [`embedded_preview`] finds the camera's full-size JPEG preview, for
-//!   formats whose sensor data is not decoded yet.
+//!   formats whose sensor data is not decoded yet; [`embedded_previews`] lists
+//!   every preview.
+//! * [`fit_look`] fits a per-file colour matrix and tone curve ([`CameraLook`])
+//!   to the camera's own (decoded) JPEG, for files without colour calibration
+//!   (method after LightCraft's `docs/camera-preview-colour.md`,
+//!   storytold/lightcraft#165); pass it in [`DevelopOptions::camera_look`].
+//! * Raws that carry no colour description (NEF) take a camera profile we
+//!   measured from the camera's own output when there is one (`cameras.rs`:
+//!   image area, levels, ForwardMatrix, tone curve; the Nikon D4 so far).
+//!   Bodies whose full profile is not measured yet can still carry a measured
+//!   image area (the D800E, the ILCE-7).
 //!
-//! Decoded today: DNG (uncompressed and lossless-JPEG, strips and tiles, CFA
-//! and LinearRaw), CR2 (lossless JPEG with Canon slices), uncompressed or
+//! Decoded today: DNG (uncompressed, deflate, lossless-JPEG, lossy-JPEG and JPEG XL, strips and
+//! tiles, CFA and LinearRaw), CR2 (lossless JPEG with Canon slices, and sRAW / mRAW), uncompressed or
 //! lossless-JPEG TIFF/EP raws (NEF, ARW, PEF… when not vendor-compressed),
-//! Sony compressed ARW (cRAW), Panasonic RW2 (RawFormat 5) and uncompressed
-//! Olympus ORF. Everything else reports [`RawError::Unsupported`].
+//! Nikon compressed NEF (lossless and lossy), Sony compressed ARW (cRAW),
+//! Panasonic RW2 (RawFormat 5 packed and RawFormat 3/4 vendor-compressed),
+//! uncompressed Olympus ORF, uncompressed Fujifilm RAF (Bayer and
+//! X-Trans), and Hasselblad 3FR/FFF (the X2D II 100C's uncompressed 16-bit CFA;
+//! see [`crate::hasselblad`]). Everything else reports [`RawError::Unsupported`].
 //!
 //! The crate is standalone (no workspace dependencies), does no I/O, builds for
 //! `wasm32-unknown-unknown` and never panics on hostile input: sizes are
@@ -30,22 +44,34 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod cameras;
 mod color;
 mod cr2;
+mod cr3;
 mod demosaic;
 mod develop;
 mod dng;
 mod error;
+mod hasselblad;
+mod jxl;
 mod ljpeg;
+mod look;
+mod nefc;
 mod opcodes;
 mod orf;
 mod par;
 mod preview;
+mod raf;
+mod rafc;
 mod rw2;
+mod saturation;
 mod sensor;
 mod sony;
+mod sony_metadata;
+mod sraw;
 mod tiff;
 mod tiffep;
+mod tone;
 
 #[cfg(feature = "testgen")]
 pub mod testgen;
@@ -54,14 +80,27 @@ pub use crate::color::{Calibration, ColorInfo, Mat3};
 pub use crate::demosaic::Demosaic;
 pub use crate::develop::{DevelopOptions, Developed, RawInfo, WhiteBalance, develop_sensor};
 pub use crate::error::RawError;
-pub use crate::opcodes::GainMap;
-pub use crate::preview::{Preview, embedded_preview};
+pub use crate::look::{CameraLook, LookRejected, PROXY_EDGE, Reference, ToneCurve, fit_look};
+pub use crate::opcodes::{GainMap, MapPolynomial};
+pub use crate::preview::{DecodedPreview, Preview, PreviewColorSpace, embedded_jxl_preview, embedded_preview, embedded_preview_color_space, embedded_previews};
 pub use crate::sensor::{BlackLevels, Cfa, Rect, Sensor};
+pub use crate::tone::{Tone, retone};
 
 use crate::tiff::{Tiff, tag};
 
 /// Name of the output colour space of [`develop`].
 pub const OUTPUT_SPACE: &str = "ProPhoto RGB (ROMM primaries, D50, gamma 1.8)";
+
+/// The raw container's orientation, when recorded (CR3 metadata or TIFF IFD0).
+/// Useful for camera JPEGs that carry no orientation of their own.
+pub fn orientation(bytes: &[u8]) -> Option<u16> {
+    if bytes.get(4..12) == Some(b"ftypcrx ") {
+        return cr3::orientation(bytes);
+    }
+    let tiff = Tiff::new(bytes)?;
+    let ifd = tiff.ifd_at(tiff.first_ifd, 0)?;
+    tiff.tag_uint(&ifd, tag::ORIENTATION).filter(|o| (1..=8).contains(o)).map(|o| o as u16)
+}
 
 /// Camera raw container families.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -83,6 +122,8 @@ pub enum RawFormat {
     Rw2,
     /// Fujifilm RAF.
     Raf,
+    /// Hasselblad 3FR / FFF.
+    Fff,
     /// Another TIFF/EP raw.
     TiffEp,
 }
@@ -99,13 +140,14 @@ impl RawFormat {
             RawFormat::Orf => "ORF",
             RawFormat::Rw2 => "RW2",
             RawFormat::Raf => "RAF",
+            RawFormat::Fff => "3FR/FFF",
             RawFormat::TiffEp => "TIFF/EP raw",
         }
     }
 }
 
 /// File extensions of the raw formats this crate recognises.
-pub const EXTENSIONS: &[&str] = &["dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "pef", "orf", "rw2", "raf"];
+pub const EXTENSIONS: &[&str] = &["dng", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "pef", "orf", "rw2", "raf", "3fr", "fff"];
 
 /// Decompression-bomb guards, checked on header values before allocating
 /// (the same shape and defaults as `photocraft-codecs`' limits).
@@ -159,6 +201,8 @@ fn make_format(make: Option<&str>) -> RawFormat {
         RawFormat::Pef
     } else if m.starts_with("OLYMPUS") || m.starts_with("OM DIGITAL") {
         RawFormat::Orf
+    } else if m.starts_with("HASSELBLAD") {
+        RawFormat::Fff
     } else {
         RawFormat::TiffEp
     }
@@ -169,7 +213,7 @@ pub fn identify(bytes: &[u8]) -> Option<RawFormat> {
     if bytes.get(4..12) == Some(b"ftypcrx ") {
         return Some(RawFormat::Cr3);
     }
-    if bytes.starts_with(b"FUJIFILMCCD-RAW") {
+    if bytes.starts_with(raf::MAGIC) {
         return Some(RawFormat::Raf);
     }
     let t = Tiff::new(bytes)?;
@@ -205,18 +249,26 @@ pub fn decode(bytes: &[u8], limits: &Limits) -> Result<Sensor, RawError> {
     let format = identify(bytes).ok_or(RawError::NotRaw)?;
     match format {
         RawFormat::Cr3 => Err(RawError::unsupported("Canon CR3 (ISO BMFF / CRX) is not decoded yet")),
-        RawFormat::Raf => Err(RawError::unsupported("Fujifilm RAF is not decoded yet")),
+        RawFormat::Raf => raf::decode(bytes, limits),
         _ => {
             let t = Tiff::new(bytes).ok_or(RawError::NotRaw)?;
             match format {
-                RawFormat::Dng => dng::decode(&t, limits),
+                RawFormat::Dng => dng::decode(&t, limits).map(lift_clipped),
                 RawFormat::Cr2 => cr2::decode(&t, limits),
                 RawFormat::Rw2 => rw2::decode(&t, limits),
                 RawFormat::Orf => orf::decode(&t, limits),
+                RawFormat::Fff => hasselblad::decode(&t, limits),
                 f => tiffep::decode(&t, f, limits),
             }
         }
     }
+}
+
+/// DNG writers can state a white level the sensor never reaches; samples stuck at the real saturation
+/// point are raised to it so they clip together (see `saturation.rs`).
+fn lift_clipped(mut s: Sensor) -> Sensor {
+    s.lift_clipped_samples();
+    s
 }
 
 /// Decodes a lossless JPEG (T.81 process 14) stream into `(width, height,

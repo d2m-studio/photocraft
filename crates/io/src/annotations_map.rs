@@ -13,13 +13,14 @@
 //!   (`pixelLength`, `logicalLength`, `logicalUnits`) follow Photoshop's scripting names for the
 //!   measurement scale; no sample file was available, so parsing is lenient and the raw resource
 //!   is kept byte-exact while the scale is unchanged.
-//! * Count information: image resource 1080 is kept verbatim (its layout is not public) unless
-//!   the document has its own count markers, which only `.pcraft` stores.
+//! * Count information: image resource 1080 (a version-16 `Cnt ` descriptor) maps to the
+//!   document's ordered Count groups. Unreadable resources are kept while there are no groups.
 
 use std::sync::Arc;
 
-use photocraft_doc::{Color, Document, MeasurementScale, Note};
-use photocraft_psd::descriptor::{Descriptor, Value, VersionedDescriptor};
+use photocraft_doc::{Color, CountGroup, Document, MeasurementScale, Note};
+use photocraft_psd::ImageResource;
+use photocraft_psd::descriptor::{Descriptor, UnicodeString, Value, VersionedDescriptor};
 
 pub const MEASUREMENT_SCALE: u16 = 1074;
 pub const COUNT_INFO: u16 = 1080;
@@ -133,6 +134,11 @@ fn parse_entries(data: &[u8]) -> Option<Vec<Entry>> {
     for _ in 0..count {
         let start = r.p;
         let len = r.u32()? as usize;
+        // The length counts itself and the type: anything shorter would put the cursor back on
+        // this entry, and a hostile count would then loop until memory runs out.
+        if len < 8 {
+            return None;
+        }
         let end = start.checked_add(len)?;
         let raw = data.get(start..end)?;
         let kind = r.take(4)?;
@@ -179,8 +185,11 @@ fn write_note(n: &Note) -> Vec<u8> {
     b.push(u8::from(n.open));
     b.push(0x1C);
     b.extend_from_slice(&1u16.to_be_bytes());
+    // The position comes from the file or a command and can sit anywhere in i32 (issue #939):
+    // the cast saturates, and the icon's far edge must saturate too rather than wrap (release) or
+    // overflow (debug) when the note is re-saved.
     let (x, y) = (n.position[0].round() as i32, n.position[1].round() as i32);
-    for v in [y, x, y + 20, x + 16] {
+    for v in [y, x, y.saturating_add(20), x.saturating_add(16)] {
         b.extend_from_slice(&v.to_be_bytes());
     }
     let pp = if n.popup == [0.0; 4] { [n.position[0] + 20.0, n.position[1] + 20.0, n.position[0] + 260.0, n.position[1] + 160.0] } else { n.popup };
@@ -226,8 +235,14 @@ pub fn notes_from_blocks(doc: &Document) -> Vec<Note> {
     doc.metadata.psd_global_blocks.iter().find(|(_, k, _)| *k == ANNO).and_then(|(_, _, d)| parse_anno(d)).unwrap_or_default()
 }
 
-/// Global blocks to write: the raw `Anno` block while it still describes `doc.notes`, else a
-/// regenerated one in its place (appended when new, dropped when the last note is deleted).
+/// Whether the document holds an `Anno` block that doesn't parse (its notes can't be shown).
+pub fn anno_unreadable(doc: &Document) -> bool {
+    doc.metadata.psd_global_blocks.iter().find(|(_, k, _)| *k == ANNO).is_some_and(|(_, _, d)| parse_entries(d).is_none())
+}
+
+/// Global blocks to write: the raw `Anno` block while it still describes `doc.notes` (or doesn't
+/// parse and no note was added), else a regenerated one in its place (appended when new, dropped
+/// when the last note is deleted).
 pub fn export_blocks(doc: &Document, mut blocks: Vec<photocraft_doc::PsdGlobalBlock>) -> Vec<photocraft_doc::PsdGlobalBlock> {
     let at = blocks.iter().position(|(_, k, _)| *k == ANNO);
     let raw = at.map(|i| blocks[i].2.clone());
@@ -243,7 +258,9 @@ pub fn export_blocks(doc: &Document, mut blocks: Vec<photocraft_doc::PsdGlobalBl
                 Note { color: y.color, ..x.clone() } == *y && cx.iter().zip(cy).all(|(p, q)| (p - q).abs() < 1.0 / 512.0)
             })
     };
-    if parsed.as_deref().zip(want.as_deref()).is_some_and(|(p, w)| same(p, w)) || (raw.is_none() && doc.notes.is_empty()) {
+    // With no notes, a block we can't read is kept as is: it isn't "the last note deleted", and
+    // dropping it would delete the annotations it holds (issue #944).
+    if parsed.as_deref().zip(want.as_deref()).is_some_and(|(p, w)| same(p, w)) || (entries.is_none() && doc.notes.is_empty()) {
         return blocks;
     }
     let extra: Vec<Vec<u8>> = entries.unwrap_or_default().into_iter().filter_map(|e| if let Entry::Raw(r) = e { Some(r) } else { None }).collect();
@@ -325,16 +342,117 @@ pub fn fresh_scale_resource(doc: &Document) -> Option<Vec<u8>> {
     (!doc.measurement.scale.is_default()).then(|| write_scale_resource(&doc.measurement.scale))
 }
 
+/// Decode the measured resource as a whole so unknown or damaged groups stay opaque.
+fn count_groups_from_resource(data: &[u8]) -> Option<Vec<CountGroup>> {
+    let d = VersionedDescriptor::from_bytes(data).ok()?.descriptor;
+    if !d.class_id.is("Cnt ") || d.items.len() != 2 || d.get("Vrsn") != Some(&Value::Integer(1)) {
+        return None;
+    }
+    let Value::List(groups) = d.get("countGroupList")? else { return None };
+    groups.iter().map(count_group_from_descriptor).collect()
+}
+
+/// Decode the fields the Count tool can use without coercing unrecognized data.
+fn count_group_from_descriptor(value: &Value) -> Option<CountGroup> {
+    let Value::Descriptor(d) = value else { return None };
+    if !d.class_id.is("countGroup") || d.items.len() != 8 {
+        return None;
+    }
+    let integer = |key| match d.get(key)? {
+        Value::Integer(n) => u32::try_from(*n).ok(),
+        _ => None,
+    };
+    let channel = |key| u8::try_from(integer(key)?).ok().map(|n| f32::from(n) / 255.0);
+    let color = Color::rgb(channel("Rd  ")?, channel("Grn ")?, channel("Bl  ")?);
+    let Value::Text(name) = d.get("Nm  ")? else { return None };
+    let Value::Boolean(visible) = d.get("Vsbl")? else { return None };
+    let Value::List(objects) = d.get("countObjectList")? else { return None };
+    let marker_size = integer("Rds ")?;
+    let label_size = integer("fontSize")?;
+    // Keep out-of-range sizes opaque instead of passing them to the marker and text renderers.
+    if !(1..=10).contains(&marker_size) || !(8..=72).contains(&label_size) {
+        return None;
+    }
+    let name = String::from_utf16(name.0.strip_suffix(&[0]).unwrap_or(&name.0)).ok()?;
+    let points = objects.iter().map(count_point_from_descriptor).collect::<Option<_>>()?;
+    Some(CountGroup { name, color, marker_size, label_size, visible: *visible, points })
+}
+
+/// Keep document coordinates as doubles and reject nonfinite values.
+fn count_point_from_descriptor(value: &Value) -> Option<[f64; 2]> {
+    let Value::Descriptor(d) = value else { return None };
+    if !d.class_id.is("countObject") || d.items.len() != 2 {
+        return None;
+    }
+    let (Value::Double(x), Value::Double(y)) = (d.get("X   ")?, d.get("Y   ")?) else { return None };
+    (x.is_finite() && y.is_finite()).then_some([*x, *y])
+}
+
+/// Consume readable Count data. Keep only opaque bytes when no resource can be read.
+pub(crate) fn import_count_resource(doc: &mut Document) {
+    if let Some(groups) = doc.metadata.psd_resources.iter().filter(|(id, _, _)| *id == COUNT_INFO).find_map(|(_, _, data)| count_groups_from_resource(data)) {
+        doc.measurement.count_groups = groups;
+        doc.metadata.psd_resources.retain(|(id, _, _)| *id != COUNT_INFO);
+    }
+}
+
+/// Resource 1080 from the current groups, warning when PSD changes sizes or omits points.
+pub(crate) fn fresh_count_resource(doc: &Document, warnings: &mut Vec<String>) -> Option<ImageResource> {
+    if doc.measurement.count_groups.is_empty() {
+        return None;
+    }
+    let groups = doc.measurement.count_groups.iter().map(|group| count_group_descriptor(group, warnings)).collect();
+    let d = Descriptor::new("Cnt ").with("Vrsn", Value::Integer(1)).with("countGroupList", Value::List(groups));
+    Some(ImageResource::new(COUNT_INFO, VersionedDescriptor::new(d).to_bytes()))
+}
+
+/// Write the measured group layout and preserve marker order.
+fn count_group_descriptor(group: &CountGroup, warnings: &mut Vec<String>) -> Value {
+    let marker_size = group.marker_size.clamp(1, 10);
+    let label_size = group.label_size.clamp(8, 72);
+    if marker_size != group.marker_size || label_size != group.label_size {
+        warnings.push(format!(
+            "Count group {:?} sizes adjusted for PSD (marker {} to {marker_size}, label {} to {label_size})",
+            group.name, group.marker_size, group.label_size
+        ));
+    }
+    let [r, g, b, _] = group.color.to_rgba8();
+    let objects: Vec<_> = group
+        .points
+        .iter()
+        .filter(|[x, y]| x.is_finite() && y.is_finite())
+        .map(|&[x, y]| Value::Descriptor(Descriptor::new("countObject").with("X   ", Value::Double(x)).with("Y   ", Value::Double(y))))
+        .collect();
+    let omitted = group.points.len() - objects.len();
+    if omitted != 0 {
+        warnings.push(format!("Count group {:?} had nonfinite points omitted from PSD export ({omitted} total)", group.name));
+    }
+    Value::Descriptor(
+        Descriptor::new("countGroup")
+            .with("Rd  ", Value::Integer(i32::from(r)))
+            .with("Grn ", Value::Integer(i32::from(g)))
+            .with("Bl  ", Value::Integer(i32::from(b)))
+            .with("Nm  ", Value::Text(UnicodeString::new_nul(&group.name)))
+            .with("Rds ", Value::Integer(marker_size as i32))
+            .with("fontSize", Value::Integer(label_size as i32))
+            .with("Vsbl", Value::Boolean(group.visible))
+            .with("countObjectList", Value::List(objects)),
+    )
+}
+
 /// Whether to keep a preserved resource with this id on export.
 pub fn keep_resource(doc: &Document, id: u16) -> bool {
     match id {
         MEASUREMENT_SCALE => keep_raw_scale(doc),
-        // Our count markers can't be written into Photoshop's (unpublished) layout; a stale copy
-        // would contradict them, so it is dropped once the document has markers of its own.
-        COUNT_INFO => doc.measurement.count_total() == 0,
+        // An opaque copy is only used when there are no document groups to write.
+        COUNT_INFO => doc.measurement.count_groups.is_empty(),
         _ => true,
     }
 }
+
+#[cfg(test)]
+#[path = "count_resource_tests.rs"]
+mod count_resource_tests;
 
 #[cfg(test)]
 mod tests {
@@ -390,6 +508,41 @@ mod tests {
         d.notes.clear();
         assert!(export_blocks(&d, out).is_empty());
         assert!(parse_anno(&[0, 2, 0, 1, 0, 0, 0, 9]).is_none());
+    }
+
+    /// Issue #944: an `Anno` block that doesn't parse was taken for "no notes" and dropped on save.
+    #[test]
+    fn export_blocks_keeps_an_unreadable_block() {
+        let mut d = Document::new("n", photocraft_doc::Size::new(10, 10), photocraft_doc::ColorMode::Rgb, photocraft_doc::SampleType::U8);
+        let bad: Vec<photocraft_doc::PsdGlobalBlock> = vec![(*b"8BIM", ANNO, Arc::new(vec![0, 2, 0, 1, 0, 0, 0, 9]))];
+        d.metadata.psd_global_blocks = bad.clone();
+        assert!(anno_unreadable(&d) && notes_from_blocks(&d).is_empty());
+        let out = export_blocks(&d, bad.clone());
+        assert_eq!(out.len(), 1);
+        assert!(Arc::ptr_eq(&out[0].2, &bad[0].2));
+        // A note added by the user still writes a fresh block in its place.
+        d.notes.push(Note { text: "new".into(), ..Default::default() });
+        let out = export_blocks(&d, bad);
+        assert_eq!(parse_anno(&out[0].2).unwrap()[0].text, "new");
+        // A readable block is not reported.
+        d.metadata.psd_global_blocks = out;
+        assert!(!anno_unreadable(&d));
+    }
+
+    /// An entry length below 8 (its own `u32` plus the type) put the cursor back on the same
+    /// entry, so a count of 0xFFFFFFFF looped ~4.3e9 times and ran out of memory.
+    #[test]
+    fn short_entry_length_is_unreadable_not_a_loop() {
+        for len in [0u8, 4, 7] {
+            for kind in [b"sndA", b"txtA"] {
+                let mut b = vec![0, 2, 0, 1, 0, 0, 0, 3, 0, 0, 0, len];
+                b.extend_from_slice(kind);
+                b.extend_from_slice(&[0; 64]);
+                assert!(parse_entries(&b).is_none(), "len {len} {kind:?}");
+            }
+        }
+        let hostile = [0, 2, 0, 1, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, b's', b'n', b'd', b'A'];
+        assert!(parse_anno(&hostile).is_none());
     }
 
     #[test]

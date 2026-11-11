@@ -1,5 +1,5 @@
 *~
-plan/
+/plan/
 /target
 target/
 /dist
@@ -9,3 +9,5 @@ target/
 /temp
 /book/output
 /craft-fonts
+*.log
+__pycache__/
